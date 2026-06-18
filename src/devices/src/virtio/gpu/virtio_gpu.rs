@@ -38,7 +38,7 @@ use rutabaga_gfx::{
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
 
 use super::{GpuError, Result};
 use crate::virtio::display::DisplayInfo;
@@ -118,6 +118,13 @@ struct VirtioGpuResource {
     size: u64, // only for blob resources
     shmem_offset: Option<u64>,
     rutabaga_external_mapping: bool,
+    // true for RESOURCE_CREATE_BLOB resources (host-visible framebuffer).
+    blob: bool,
+    // true for plain RESOURCE_CREATE_2D dumb-buffer resources, serviced
+    // host-side WITHOUT virglrenderer. The pixel data + guest backing live in `Native2d` keyed by id.
+    native_2d: bool,
+    // byte stride of the scanout, captured from SET_SCANOUT_BLOB.
+    scanout_stride: u32,
 }
 
 impl VirtioGpuResource {
@@ -139,8 +146,23 @@ impl VirtioGpuResource {
             format,
             shmem_offset: None,
             rutabaga_external_mapping: false,
+            blob: false,
+            native_2d: false,
+            scanout_stride: 0,
         }
     }
+}
+
+/// host-side state for a plain 2D dumb-buffer resource. Holds the guest
+/// backing iovecs (plain guest RAM, host-accessible) plus a host shadow buffer that TRANSFER_TO_HOST_2D
+/// fills and RESOURCE_FLUSH presents. No virglrenderer involved.
+struct Native2dResource {
+    width: u32,
+    height: u32,
+    /// Tightly-packed BGRA shadow buffer, width*height*4 bytes.
+    shadow: Vec<u8>,
+    /// Guest backing as (addr, len) tuples in flat order (one contiguous logical buffer).
+    backing: Vec<(GuestAddress, usize)>,
 }
 
 pub struct VirtioGpuScanout {
@@ -150,12 +172,16 @@ pub struct VirtioGpuScanout {
 pub struct VirtioGpu {
     rutabaga: Rutabaga,
     resources: BTreeMap<u32, VirtioGpuResource>,
+    // host-side 2D resources keyed by resource_id, parallel to `resources`.
+    native_2d: BTreeMap<u32, Native2dResource>,
     fence_state: Arc<Mutex<FenceState>>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackendInstance,
+    // guest memory handle for reading native-2D backing iovecs directly.
+    mem: GuestMemoryMmap,
 }
 
 impl VirtioGpu {
@@ -340,10 +366,13 @@ impl VirtioGpu {
         Self {
             rutabaga,
             resources: Default::default(),
+            native_2d: Default::default(),
             fence_state,
             scanouts: Default::default(),
             displays,
             display_backend,
+            // keep guest memory for reading native-2D backing iovecs directly
+            mem,
             #[cfg(target_os = "macos")]
             map_sender,
         }
@@ -372,6 +401,45 @@ impl VirtioGpu {
 
     pub fn force_ctx_0(&self) {
         self.rutabaga.force_ctx_0()
+    }
+
+    /// is this resource a native (virgl-free) 2D dumb buffer?
+    pub fn is_native_2d(&self, resource_id: u32) -> bool {
+        self.native_2d.contains_key(&resource_id)
+    }
+
+    /// native, virglrenderer-free RESOURCE_CREATE_2D (0x101).
+    /// Models the QEMU non-virgl 2D / crosvm 2D path: record geometry + a host shadow buffer and
+    /// mark the resource native_2d. The guest's primary framebuffer (fbcon + X/Wayland KMS plane)
+    /// always uses this dumb-buffer path, so this is the resource the scanout actually flushes.
+    pub fn resource_create_2d(
+        &mut self,
+        resource_id: u32,
+        format: u32,
+        width: u32,
+        height: u32,
+    ) -> VirtioGpuResult {
+        let fmt = ResourceFormat::try_from(format).ok();
+        if fmt.is_none() {
+            warn!("native-2d: unknown format {format} for resource {resource_id}");
+        }
+
+        let mut resource = VirtioGpuResource::new(resource_id, width, height, fmt, 0);
+        resource.native_2d = true;
+        self.resources.insert(resource_id, resource);
+
+        let stride = width as usize * ResourceFormat::BYTES_PER_PIXEL;
+        self.native_2d.insert(
+            resource_id,
+            Native2dResource {
+                width,
+                height,
+                shadow: vec![0u8; stride * height as usize],
+                backing: Vec::new(),
+            },
+        );
+        eprintln!("[native-2d] resource_create_2d (NATIVE) resource_id={resource_id} {width}x{height} fmt={format}");
+        Ok(OkNoData)
     }
 
     /// Creates a 3D resource with the given properties and resource_id.
@@ -417,6 +485,12 @@ impl VirtioGpu {
                      associated scanouts, refusing to delete the resource."
             );
             return Err(ErrUnspec);
+        }
+
+        // native-2D resources never touched rutabaga; just drop host state.
+        if resource.native_2d {
+            self.native_2d.remove(&resource_id);
+            return Ok(OkNoData);
         }
 
         if resource.rutabaga_external_mapping {
@@ -475,6 +549,7 @@ impl VirtioGpu {
             .get(scanout_id as usize)
             .ok_or(ErrInvalidScanoutId)?;
 
+        eprintln!("[native-2d] configure_scanout scanout_id={scanout_id} resource_id={resource_id} {width}x{height}");
         self.display_backend.configure_scanout(
             scanout_id,
             display_info.width,
@@ -482,6 +557,84 @@ impl VirtioGpu {
             width,
             height,
             format,
+        )?;
+
+        *scanout = Some(VirtioGpuScanout { resource_id });
+        Ok(OkNoData)
+    }
+
+    /// SET_SCANOUT_BLOB (0x10d). A modern Venus guest scans out a host-visible
+    /// blob resource instead of a legacy 2D resource. Mirror set_scanout() but take width/height/
+    /// format/stride from the command (blob resources are created with width=0/height=0/format=None)
+    /// and record the stride so flush can copy the host-visible pixels into the backend frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_scanout_blob(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        format: u32,
+        width: u32,
+        height: u32,
+        strides: [u32; 4],
+        _offsets: [u32; 4],
+    ) -> VirtioGpuResult {
+        let scanout = self
+            .scanouts
+            .get_mut(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+
+        // If a resource is already associated with this scanout, disable it for that resource.
+        if let Some(prev_id) = scanout.as_ref().map(|s| s.resource_id) {
+            if let Some(prev) = self.resources.get_mut(&prev_id) {
+                prev.scanouts.disable(scanout_id);
+            }
+        }
+
+        // resource_id == 0 disables the scanout.
+        if resource_id == 0 {
+            debug!("Disabling scanout {scanout_id:?} (blob)");
+            *scanout = None;
+            self.display_backend.disable_scanout(scanout_id)?;
+            return Ok(OkNoData);
+        }
+
+        let resource = self
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+
+        let Some(fmt) = ResourceFormat::try_from(format).ok() else {
+            warn!("SET_SCANOUT_BLOB: unknown format {format} for resource {resource_id}");
+            return Err(ErrUnspec);
+        };
+
+        // Stamp the blob resource with the scanout geometry so flush can read it.
+        resource.scanouts.enable(scanout_id);
+        resource.width = width;
+        resource.height = height;
+        resource.format = Some(fmt);
+        resource.scanout_stride = if strides[0] != 0 {
+            strides[0]
+        } else {
+            width * ResourceFormat::BYTES_PER_PIXEL as u32
+        };
+
+        let display_info = self
+            .displays
+            .get(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+
+        eprintln!(
+            "[native-2d] configure_scanout (BLOB) scanout_id={scanout_id} resource_id={resource_id} {width}x{height} fmt={format} stride={}",
+            resource.scanout_stride
+        );
+        self.display_backend.configure_scanout(
+            scanout_id,
+            display_info.width,
+            display_info.height,
+            width,
+            height,
+            fmt,
         )?;
 
         *scanout = Some(VirtioGpuScanout { resource_id });
@@ -514,6 +667,62 @@ impl VirtioGpu {
         Ok(OkNoData)
     }
 
+    /// read a host-visible blob scanout resource into `output`, honoring the
+    /// source stride captured at SET_SCANOUT_BLOB time. The blob bytes live in host memory mapped
+    /// by virglrenderer/Venus; we obtain the host pointer via rutabaga.map() (falling back to the
+    /// macOS map_ptr recorded at create time).
+    fn read_blob_resource(
+        rutabaga: &mut Rutabaga,
+        resource: &VirtioGpuResource,
+        output: &mut [u8],
+    ) -> VirtioGpuResult {
+        let bpp = ResourceFormat::BYTES_PER_PIXEL;
+        let src_stride = resource.scanout_stride as usize;
+        let dst_stride = resource.width as usize * bpp;
+        let height = resource.height as usize;
+
+        // Try the active map first (works for Venus host-visible blobs).
+        let (src_ptr, src_size) = match rutabaga.map(resource.id) {
+            Ok(m) => (m.ptr, m.size as usize),
+            Err(_) => {
+                #[cfg(target_os = "macos")]
+                {
+                    match rutabaga.map_ptr(resource.id) {
+                        Ok(ptr) => (ptr, resource.size as usize),
+                        Err(e) => {
+                            log::error!("blob scanout: no host mapping for {}: {e}", resource.id);
+                            return Err(ErrUnspec);
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    log::error!("blob scanout: rutabaga.map failed for {}", resource.id);
+                    return Err(ErrUnspec);
+                }
+            }
+        };
+
+        if src_ptr == 0 || src_size == 0 {
+            log::error!("blob scanout: null host mapping for {}", resource.id);
+            return Err(ErrUnspec);
+        }
+
+        // SAFETY: src_ptr/src_size come from rutabaga as a valid host mapping of the blob.
+        let src = unsafe { std::slice::from_raw_parts(src_ptr as *const u8, src_size) };
+
+        let copy_w = dst_stride.min(src_stride);
+        for row in 0..height {
+            let so = row * src_stride;
+            let dofs = row * dst_stride;
+            if so + copy_w > src.len() || dofs + copy_w > output.len() {
+                break;
+            }
+            output[dofs..dofs + copy_w].copy_from_slice(&src[so..so + copy_w]);
+        }
+        Ok(OkNoData)
+    }
+
     /// If the resource is the scanout resource, flush it to the display.
     pub fn flush_resource(&mut self, resource_id: u32, rect: Rect) -> VirtioGpuResult {
         if resource_id == 0 {
@@ -527,12 +736,29 @@ impl VirtioGpu {
 
         for scanout_id in resource.scanouts.iter_enabled() {
             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
-            if let Err(e) = Self::read_2d_resource(&mut self.rutabaga, resource, buffer) {
-                log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e}");
+            let read = if resource.native_2d {
+                // copy the host shadow buffer into the frame. Both are
+                // tightly-packed BGRA at stride = width*4, so a single copy suffices.
+                match self.native_2d.get(&resource_id) {
+                    Some(native) => {
+                        let n = native.shadow.len().min(buffer.len());
+                        buffer[..n].copy_from_slice(&native.shadow[..n]);
+                        Ok(OkNoData)
+                    }
+                    None => Err(ErrInvalidResourceId),
+                }
+            } else if resource.blob {
+                Self::read_blob_resource(&mut self.rutabaga, &resource, buffer)
+            } else {
+                Self::read_2d_resource(&mut self.rutabaga, resource, buffer)
+            };
+            if let Err(e) = read {
+                log::error!("Failed to read resource {resource_id} for scanout {scanout_id}: {e:?}");
                 return Err(ErrUnspec);
             }
             self.display_backend
-                .present_frame(scanout_id, frame_id, Some(&rect))?
+                .present_frame(scanout_id, frame_id, Some(&rect))
+                .inspect(|_| eprintln!("[native-2d] present_frame scanout_id={scanout_id} frame_id={frame_id} native_2d={} blob={}", resource.native_2d, resource.blob))?
         }
 
         #[cfg(windows)]
@@ -576,6 +802,107 @@ impl VirtioGpu {
         Ok(OkNoData)
     }
 
+    /// native TRANSFER_TO_HOST_2D (0x105). Copy the transfer rect from the
+    /// guest-attached backing (plain guest RAM iovecs) into the host shadow buffer, honoring the
+    /// guest `offset` and the resource stride. The guest backing is laid out tightly-packed at
+    /// stride = width*4 (the dumb-buffer convention); `offset` is the byte start of the rect's first
+    /// row within that buffer.
+    pub fn transfer_to_host_2d(
+        &mut self,
+        resource_id: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        offset: u64,
+    ) -> VirtioGpuResult {
+        let bpp = ResourceFormat::BYTES_PER_PIXEL;
+        let native = self
+            .native_2d
+            .get_mut(&resource_id)
+            .ok_or(ErrInvalidResourceId)?;
+
+        let stride = native.width as usize * bpp;
+        let res_h = native.height as usize;
+        let rect_w = (w as usize).min((native.width as usize).saturating_sub(x as usize));
+        let rect_h = h as usize;
+
+        // Read the needed region from the guest backing into a temporary linear buffer, then scatter
+        // it into the shadow at the right rows/columns. We read [offset .. offset + rect_h*stride).
+        let region_len = rect_h.saturating_mul(stride);
+        if region_len == 0 {
+            return Ok(OkNoData);
+        }
+        let mut region = vec![0u8; region_len];
+        Self::read_backing(&self.mem, &native.backing, offset as usize, &mut region)?;
+
+        let row_bytes = rect_w * bpp;
+        let x_off = x as usize * bpp;
+        for row in 0..rect_h {
+            let dst_y = y as usize + row;
+            if dst_y >= res_h {
+                break;
+            }
+            let src_o = row * stride; // region is packed at full stride starting at `offset`
+            let dst_o = dst_y * stride + x_off;
+            if src_o + row_bytes > region.len() || dst_o + row_bytes > native.shadow.len() {
+                break;
+            }
+            native.shadow[dst_o..dst_o + row_bytes]
+                .copy_from_slice(&region[src_o..src_o + row_bytes]);
+        }
+        Ok(OkNoData)
+    }
+
+    /// read `out.len()` bytes starting at logical byte `offset` from the
+    /// guest backing iovec list into `out`, walking iovecs and using GuestMemory::read_slice
+    /// (the iovecs point at plain guest RAM, host-readable).
+    fn read_backing(
+        mem: &GuestMemoryMmap,
+        backing: &[(GuestAddress, usize)],
+        offset: usize,
+        out: &mut [u8],
+    ) -> VirtioGpuResult {
+        if backing.is_empty() {
+            log::error!("native-2d transfer: resource has no backing");
+            return Err(ErrUnspec);
+        }
+        let mut want = out.len();
+        let mut out_pos = 0usize;
+        let mut logical = 0usize; // running byte position across the iovec list
+        for &(addr, len) in backing {
+            if want == 0 {
+                break;
+            }
+            let seg_start = logical;
+            let seg_end = logical + len;
+            logical = seg_end;
+            // Skip segments entirely before `offset`.
+            if seg_end <= offset {
+                continue;
+            }
+            // Compute the slice of this segment we need.
+            let skip = offset.saturating_sub(seg_start);
+            let avail = len - skip;
+            let take = avail.min(want);
+            let gaddr = GuestAddress(addr.0 + skip as u64);
+            if mem
+                .read_slice(&mut out[out_pos..out_pos + take], gaddr)
+                .is_err()
+            {
+                log::error!("native-2d transfer: read_slice failed at {gaddr:?} len {take}");
+                return Err(ErrUnspec);
+            }
+            out_pos += take;
+            want -= take;
+        }
+        if want != 0 {
+            log::error!("native-2d transfer: backing too small, {want} bytes short");
+            return Err(ErrUnspec);
+        }
+        Ok(OkNoData)
+    }
+
     /// Copies data from the host resource to:
     ///    1) To the optional volatile slice
     ///    2) To the host resource's attached iovecs
@@ -600,6 +927,18 @@ impl VirtioGpu {
         mem: &GuestMemoryMmap,
         vecs: Vec<(GuestAddress, usize)>,
     ) -> VirtioGpuResult {
+        // for native-2D resources, just record the guest backing iovecs
+        // (plain guest RAM); never hand them to rutabaga/virgl.
+        if let Some(native) = self.native_2d.get_mut(&resource_id) {
+            let total: usize = vecs.iter().map(|&(_, len)| len).sum();
+            native.backing = vecs;
+            eprintln!(
+                "[native-2d] attach_backing (NATIVE) resource_id={resource_id} entries={} bytes={total}",
+                native.backing.len()
+            );
+            return Ok(OkNoData);
+        }
+
         let rutabaga_iovecs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
         self.rutabaga.attach_backing(resource_id, rutabaga_iovecs)?;
         Ok(OkNoData)
@@ -607,6 +946,11 @@ impl VirtioGpu {
 
     /// Detaches any previously attached iovecs from the resource.
     pub fn detach_backing(&mut self, resource_id: u32) -> VirtioGpuResult {
+        // native-2D resources keep their backing in `native_2d`.
+        if let Some(native) = self.native_2d.get_mut(&resource_id) {
+            native.backing.clear();
+            return Ok(OkNoData);
+        }
         self.rutabaga.detach_backing(resource_id)?;
         Ok(OkNoData)
     }
@@ -741,7 +1085,9 @@ impl VirtioGpu {
             None,
         )?;
 
-        let resource = VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);
+        let mut resource =
+            VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);
+        resource.blob = true;
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);

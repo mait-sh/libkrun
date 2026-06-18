@@ -8,10 +8,7 @@ use utils::eventfd::EventFd;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
-use rutabaga_gfx::{
-    ResourceCreate3D, ResourceCreateBlob, RutabagaFence, Transfer3D,
-    RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D,
-};
+use rutabaga_gfx::{ResourceCreate3D, ResourceCreateBlob, RutabagaFence, Transfer3D};
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
@@ -123,26 +120,21 @@ impl Worker {
     ) -> VirtioGpuResult {
         virtio_gpu.force_ctx_0();
 
+        // trace every virtio-gpu control command.
+        eprintln!("[gpu-cmd] type=0x{:x} {}", hdr.type_, crate::virtio::gpu::protocol::virtio_gpu_cmd_str(hdr.type_));
         match cmd {
             GpuCommand::GetDisplayInfo => virtio_gpu.display_info(),
             GpuCommand::GetEdid(info) => virtio_gpu.get_edid(info.scanout),
             GpuCommand::ResourceCreate2d(info) => {
-                let resource_id = info.resource_id;
-
-                let resource_create_3d = ResourceCreate3D {
-                    target: RUTABAGA_PIPE_TEXTURE_2D,
-                    format: info.format,
-                    bind: RUTABAGA_PIPE_BIND_RENDER_TARGET,
-                    width: info.width,
-                    height: info.height,
-                    depth: 1,
-                    array_size: 1,
-                    last_level: 0,
-                    nr_samples: 0,
-                    flags: 0,
-                };
-
-                virtio_gpu.resource_create_3d(resource_id, resource_create_3d)
+                // service plain 2D dumb buffers host-side, WITHOUT
+                // virglrenderer (whose vrend/GL renderer is broken on macOS). This is the path the
+                // real guest's primary framebuffer (fbcon + X/Wayland KMS plane) actually uses.
+                virtio_gpu.resource_create_2d(
+                    info.resource_id,
+                    info.format,
+                    info.width,
+                    info.height,
+                )
             }
             GpuCommand::ResourceUnref(info) => virtio_gpu.unref_resource(info.resource_id),
             GpuCommand::SetScanout(info) => virtio_gpu.set_scanout(
@@ -161,9 +153,22 @@ impl Worker {
                 virtio_gpu.flush_resource(info.resource_id, rect)
             }
             GpuCommand::TransferToHost2d(info) => {
-                let resource_id = info.resource_id;
-                let transfer = Transfer3D::new_2d(info.r.x, info.r.y, info.r.width, info.r.height);
-                virtio_gpu.transfer_write(0, resource_id, transfer)
+                // native 2D resources copy guest backing -> host shadow
+                // buffer directly; 3D-backed resources still go through rutabaga.
+                if virtio_gpu.is_native_2d(info.resource_id) {
+                    virtio_gpu.transfer_to_host_2d(
+                        info.resource_id,
+                        info.r.x,
+                        info.r.y,
+                        info.r.width,
+                        info.r.height,
+                        info.offset,
+                    )
+                } else {
+                    let transfer =
+                        Transfer3D::new_2d(info.r.x, info.r.y, info.r.width, info.r.height);
+                    virtio_gpu.transfer_write(0, info.resource_id, transfer)
+                }
             }
             GpuCommand::ResourceAttachBacking(info) => {
                 let available_bytes = reader.available_bytes();
@@ -331,9 +336,15 @@ impl Worker {
                     mem,
                 )
             }
-            GpuCommand::SetScanoutBlob(_info) => {
-                panic!("virtio_gpu: GpuCommand::SetScanoutBlob unimplemented");
-            }
+            GpuCommand::SetScanoutBlob(info) => virtio_gpu.set_scanout_blob(
+                info.scanout_id,
+                info.resource_id,
+                info.format,
+                info.width,
+                info.height,
+                info.strides,
+                info.offsets,
+            ),
             GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id;
                 let offset = info.offset;
