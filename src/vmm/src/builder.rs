@@ -609,7 +609,19 @@ pub fn build_microvm(
         kernel_cmdline.insert_str(cmdline).unwrap();
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), target_os = "macos"))]
+    #[allow(unused_mut)]
+    let mut vm = {
+        #[cfg(feature = "gpu")]
+        let gpu_shm_base = _shm_manager
+            .gpu_region()
+            .map(|r| r.guest_addr.raw_value());
+        #[cfg(not(feature = "gpu"))]
+        let gpu_shm_base: Option<u64> = None;
+        setup_vm(&guest_memory, vm_resources.nested_enabled, gpu_shm_base)?
+    };
+
+    #[cfg(all(not(feature = "tee"), not(target_os = "macos")))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
 
@@ -1586,11 +1598,12 @@ pub(crate) fn setup_vm(
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     nested_enabled: bool,
+    gpu_shm_base: Option<u64>,
 ) -> std::result::Result<Vm, StartMicrovmError> {
     let mut vm = Vm::new(nested_enabled)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
-    vm.memory_init(guest_memory)
+    vm.memory_init(guest_memory, gpu_shm_base)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     Ok(vm)

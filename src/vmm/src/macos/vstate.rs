@@ -88,6 +88,10 @@ impl Display for Error {
     }
 }
 
+/// Host page size on Apple Silicon (macOS native page = 16 KiB). `hv_vm_map` and
+/// `hv_vm_unmap` require their size argument to be a multiple of this.
+const HVF_PAGE_SIZE: u64 = 0x4000;
+
 pub type Result<T> = result::Result<T, Error>;
 
 /// A wrapper around creating and using a VM.
@@ -108,22 +112,38 @@ impl Vm {
     }
 
     /// Initializes the guest memory.
-    pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
+    ///
+    /// `gpu_shm_base` is the guest physical address of the virtio-gpu host-visible
+    /// SHM window, if any. On macOS/Hypervisor.framework that window MUST be left as
+    /// an unmapped GPA hole: host-visible blobs are installed into it on demand via
+    /// `hv_vm_map` (see `add_mapping`). Pre-mapping it as one large region makes the
+    /// later per-blob `hv_vm_unmap`/`hv_vm_map` of a sub-range fail with HV_BAD_ARGUMENT,
+    /// because HVF does not allow unmapping/replacing part of an existing mapping.
+    pub fn memory_init(
+        &mut self,
+        guest_mem: &GuestMemoryMmap,
+        gpu_shm_base: Option<u64>,
+    ) -> Result<()> {
         for region in guest_mem.iter() {
+            let guest_addr = region.start_addr().raw_value();
+            if Some(guest_addr) == gpu_shm_base {
+                debug!(
+                    "Skipping HVF map of virtio-gpu host-visible window guest_addr={:x?} len={:x?} (mapped on demand per-blob)",
+                    guest_addr,
+                    region.len()
+                );
+                continue;
+            }
             // It's safe to unwrap because the guest address is valid.
             let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap();
             debug!(
                 "Guest memory host_addr={:x?} guest_addr={:x?} len={:x?}",
                 host_addr,
-                region.start_addr().raw_value(),
+                guest_addr,
                 region.len()
             );
             self.hvf_vm
-                .map_memory(
-                    host_addr as u64,
-                    region.start_addr().raw_value(),
-                    region.len(),
-                )
+                .map_memory(host_addr as u64, guest_addr, region.len())
                 .map_err(Error::SetUserMemoryRegion)?;
         }
 
@@ -137,9 +157,19 @@ impl Vm {
         guest_addr: u64,
         len: u64,
     ) {
+        // HVF (hv_vm_map/hv_vm_unmap) requires the mapping size to be a multiple of the host
+        // page size, which is 16 KiB on Apple Silicon. virtio-gpu host-visible blobs (e.g. the
+        // Venus command ring) are sized in 4 KiB units (e.g. 0x21000) and would otherwise be
+        // rejected with HV_BAD_ARGUMENT. The blob's host mapping is itself 16 KiB-page backed,
+        // so rounding the length up only ever covers valid host memory.
+        let len = (len + (HVF_PAGE_SIZE - 1)) & !(HVF_PAGE_SIZE - 1);
         debug!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+        // The GPU host-visible window is left as an unmapped GPA hole (see memory_init), so on
+        // the first mapping of a given page there is nothing to unmap. We still attempt the
+        // unmap to cover re-use of the same GPA by a later blob; a failure here just means the
+        // range was not mapped yet, which is expected and not an error.
         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
-            error!("Error removing memory map: {e:?}");
+            debug!("add_mapping: pre-unmap of {guest_addr:x}/{len} not needed: {e:?}");
         }
 
         if let Err(e) = self.hvf_vm.map_memory(host_addr, guest_addr, len) {
@@ -151,6 +181,7 @@ impl Vm {
     }
 
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        let len = (len + (HVF_PAGE_SIZE - 1)) & !(HVF_PAGE_SIZE - 1);
         debug!("remove_mapping: guest_addr={guest_addr:x}, len={len}");
         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
             error!("Error removing memory map: {e:?}");
