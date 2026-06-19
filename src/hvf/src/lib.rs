@@ -240,6 +240,36 @@ static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
 impl HvfVm {
     pub fn new(nested_enabled: bool) -> Result<Self, Error> {
         let config = unsafe { hv_vm_config_create() };
+
+        // macOS 26+: force a 4 KiB stage-2 IPA granule. Apple Silicon's default
+        // granule is 16 KiB, which forces `hv_vm_map` to reject the 4 KiB-aligned,
+        // densely-packed host-visible virtio-gpu (Venus) blobs a stock 4 KiB-page
+        // guest produces (two blobs land in one 16 KiB host page -> HV_BAD_ARGUMENT
+        // -> guest RESOURCE_MAP_BLOB OUT_OF_MEMORY). Selecting a 4 KiB granule lets
+        // those blobs map without a custom 16 KiB-page guest kernel. The symbol is
+        // macOS-26-only; via dlsym (like `set_el2_enabled`) it is a silent no-op on
+        // older systems, leaving the existing 16 KiB-default path untouched. On
+        // Apple Silicon both granules expose the same max IPA, so there is no cost.
+        // HV_IPA_GRANULE_4KB == 0 (hv_ipa_granule_t, hv_vm_config.h, macOS 26 SDK).
+        const HV_IPA_GRANULE_4KB: u32 = 0;
+        let set_ipa_granule: Result<
+            libloading::Symbol<'static, unsafe extern "C" fn(hv_vm_config_t, u32) -> hv_return_t>,
+            libloading::Error,
+        > = unsafe { HVF.get(b"hv_vm_config_set_ipa_granule") };
+        match set_ipa_granule {
+            Ok(set_granule) => {
+                let ret = unsafe { (set_granule)(config, HV_IPA_GRANULE_4KB) };
+                if ret != HV_SUCCESS {
+                    warn!("hv_vm_config_set_ipa_granule(4KB) failed: {ret:?}; keeping default granule");
+                } else {
+                    debug!("HVF stage-2 IPA granule set to 4KB");
+                }
+            }
+            Err(_) => {
+                debug!("hv_vm_config_set_ipa_granule unavailable (macOS < 26); keeping default granule");
+            }
+        }
+
         if nested_enabled {
             let set_el2_enabled: libloading::Symbol<
                 'static,
